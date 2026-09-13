@@ -1,667 +1,945 @@
-import React, { useState, useEffect } from 'react';
-import DashboardLayout from '../layouts/DashboardLayout';
-import Loader from '../components/Loader';
-import { useAuth } from '../context/AuthContext';
-import { supabase } from '../services/supabase';
-import { getSignedImageUrl } from '../services/storage';
 
-const SuggestedMatches = () => {
+import React, { useEffect, useState } from "react";
+import DashboardLayout from "../layouts/DashboardLayout";
+import Loader from "../components/Loader";
+import { useAuth } from "../context/AuthContext";
+import { supabase } from "../services/supabase";
+
+const HANDOVER_LOCATIONS = [
+  "Campus Security Office",
+  "Lost & Found Office",
+  "Library Help Desk",
+  "Student Affairs Office",
+];
+
+export default function SuggestedMatches() {
   const { user } = useAuth();
 
   const [loading, setLoading] = useState(true);
   const [matches, setMatches] = useState([]);
   const [selectedMatch, setSelectedMatch] = useState(null);
+
+  const [claimStatus, setClaimStatus] = useState(null);
+  const [contactInfo, setContactInfo] = useState(null);
+
+  const [loadingClaim, setLoadingClaim] = useState(false);
   const [claiming, setClaiming] = useState(false);
-  const [images, setImages] = useState({ lost: '', found: '' });
+
+  const [images, setImages] = useState({
+    lost: null,
+    found: null,
+  });
+
+  useEffect(() => {
+    if (user) {
+      fetchMatches();
+    }
+  }, [user]);
 
   const fetchMatches = async () => {
-    if (!user?.id) {
-      setMatches([]);
-      setLoading(false);
-      return;
-    }
-
-    setLoading(true);
-
     try {
+      setLoading(true);
+
       const { data, error } = await supabase
-        .from('ai_matches')
+        .from("ai_matches")
         .select(`
-      id,
-      created_at,
-      match_score,
-      similarities,
-      differences,
-      confidence,
-      recommendation,
-      status,
-      lost_item:lost_item_id (*),
-      found_item:found_item_id (*)
-    `)
-        .eq('status', 'pending')
-        .order('match_score', { ascending: false });
+          id,
+          created_at,
+          match_score,
+          similarities,
+          differences,
+          confidence,
+          recommendation,
+          status,
+          lost_item:lost_item_id (*),
+          found_item:found_item_id (*)
+        `)
+        .eq("status", "pending")
+        .order("match_score", { ascending: false });
 
       if (error) {
         throw error;
       }
 
-      const userMatches = (data || []).filter(
-        (match) =>
-          match.lost_item?.user_id === user.id ||
-          match.found_item?.user_id === user.id
-      );
+      const userMatches = (data || []).filter((match) => {
+        const lostOwner = match.lost_item?.user_id;
+        const foundOwner = match.found_item?.user_id;
+
+        return (
+          lostOwner === user.id ||
+          foundOwner === user.id
+        );
+      });
 
       setMatches(userMatches);
-    } catch (err) {
-      console.error('Failed to load matches:', err);
-      setMatches([]);
+    } catch (error) {
+      console.error("Error fetching suggested matches:", error);
+      alert("Unable to load suggested matches.");
     } finally {
       setLoading(false);
     }
-
   };
 
-  useEffect(() => {
-    fetchMatches();
-  }, [user]);
+  const loadImages = (match) => {
+    setImages({
+      lost:
+        match.lost_item?.image_url ||
+        match.lost_item?.image ||
+        match.lost_item?.photo_url ||
+        null,
 
-  useEffect(() => {
-    const loadMatchImages = async () => {
-      if (!selectedMatch) {
-        setImages({ lost: '', found: '' });
-        return;
-      }
-
-      let lostUrl = '';
-      let foundUrl = '';
-
-      try {
-        if (selectedMatch.lost_item?.image_url) {
-          lostUrl = await getSignedImageUrl(
-            selectedMatch.lost_item.image_url
-          );
-        }
-
-        if (selectedMatch.found_item?.image_url) {
-          foundUrl = await getSignedImageUrl(
-            selectedMatch.found_item.image_url
-          );
-        }
-
-        setImages({
-          lost: lostUrl,
-          found: foundUrl
-        });
-      } catch (err) {
-        console.error('Error fetching match images:', err);
-        setImages({
-          lost: '',
-          found: ''
-        });
-      }
-    };
-
-    loadMatchImages();
-
-  }, [selectedMatch]);
-
-  const handleSelectMatch = (match) => {
-    setSelectedMatch(match);
+      found:
+        match.found_item?.image_url ||
+        match.found_item?.image ||
+        match.found_item?.photo_url ||
+        null,
+    });
   };
 
-  const handleBackToList = () => {
-    setSelectedMatch(null);
-  };
-
-  const handleDismissMatch = async (matchId) => {
-    const confirmed = window.confirm(
-      'Are you sure you want to dismiss this match suggestion?'
-    );
-
-    if (!confirmed) {
+  const loadClaimAndContact = async (match) => {
+    if (!user || !match) {
       return;
     }
 
     try {
+      setLoadingClaim(true);
+      setClaimStatus(null);
+      setContactInfo(null);
+
+      const lostItemId = match.lost_item?.id;
+      const foundItemId = match.found_item?.id;
+
+      if (!lostItemId || !foundItemId) {
+        return;
+      }
+
+      const { data: claims, error: claimError } =
+        await supabase
+          .from("claims")
+          .select("id, status, claimant_id, created_at")
+          .eq("lost_item_id", lostItemId)
+          .eq("found_item_id", foundItemId)
+          .order("created_at", { ascending: false })
+          .limit(1);
+
+      if (claimError) {
+        throw claimError;
+      }
+
+      const claim = claims?.[0];
+
+      if (!claim) {
+        setClaimStatus(null);
+        return;
+      }
+
+      setClaimStatus(claim.status);
+
+      if (claim.status !== "approved") {
+        return;
+      }
+
+      const { data: contact, error: contactError } =
+        await supabase.rpc("get_approved_contact", {
+          p_lost_item_id: lostItemId,
+          p_found_item_id: foundItemId,
+        });
+
+      if (contactError) {
+        console.error(
+          "Secure contact lookup failed:",
+          contactError
+        );
+        return;
+      }
+
+      if (contact && contact.length > 0) {
+        setContactInfo(contact[0]);
+      }
+    } catch (error) {
+      console.error(
+        "Error loading claim information:",
+        error
+      );
+    } finally {
+      setLoadingClaim(false);
+    }
+  };
+
+  const openMatch = async (match) => {
+    setSelectedMatch(match);
+
+    setClaimStatus(null);
+    setContactInfo(null);
+
+    loadImages(match);
+    await loadClaimAndContact(match);
+  };
+
+  const handleDismissMatch = async (matchId) => {
+    try {
       const { error } = await supabase
-        .from('ai_matches')
+        .from("ai_matches")
         .update({
-          status: 'dismissed'
+          status: "dismissed",
         })
-        .eq('id', matchId);
+        .eq("id", matchId);
 
       if (error) {
         throw error;
       }
 
-      setSelectedMatch(null);
-      await fetchMatches();
-    } catch (err) {
-      console.error('Failed to dismiss suggestion:', err);
-      alert(
-        'Failed to dismiss suggestion: ' +
-        (err?.message || 'Unknown error')
+      setMatches((current) =>
+        current.filter((match) => match.id !== matchId)
       );
-    }
 
+      setSelectedMatch(null);
+    } catch (error) {
+      console.error(
+        "Error dismissing match:",
+        error
+      );
+
+      alert("Unable to dismiss this suggestion.");
+    }
   };
 
   const handleInitiateClaim = async () => {
-    if (!selectedMatch || !user?.id) {
+    if (!user || !selectedMatch) {
       return;
     }
 
-    if (!selectedMatch.lost_item?.id || !selectedMatch.found_item?.id) {
-      alert('This match is missing item information.');
+    const lostItemId = selectedMatch.lost_item?.id;
+    const foundItemId = selectedMatch.found_item?.id;
+
+    if (!lostItemId || !foundItemId) {
+      alert(
+        "Unable to identify the items for this claim."
+      );
       return;
     }
-
-    setClaiming(true);
 
     try {
-      const claimData = {
-        lost_item_id: selectedMatch.lost_item.id,
-        found_item_id: selectedMatch.found_item.id,
-        claimant_id: user.id,
-        status: 'pending'
-      };
+      setClaiming(true);
 
       const {
-        error: claimErr
+        data: existingClaims,
+        error: existingError,
       } = await supabase
-        .from('claims')
-        .insert([claimData]);
+        .from("claims")
+        .select("id, status")
+        .eq("lost_item_id", lostItemId)
+        .eq("found_item_id", foundItemId)
+        .eq("claimant_id", user.id)
+        .order("created_at", { ascending: false })
+        .limit(1);
 
-      if (claimErr) {
-        throw claimErr;
+      if (existingError) {
+        throw existingError;
       }
 
-      const { error: claimantNotificationError } =
-        await supabase
-          .from('notifications')
-          .insert([
-            {
-              user_id: user.id,
-              title: 'Claim Submitted Successfully',
-              message:
-                `Your ownership claim request for "${selectedMatch.lost_item.item_name}" has been filed. An administrator will verify details shortly.`
-            }
-          ]);
+      if (
+        existingClaims &&
+        existingClaims.length > 0
+      ) {
+        const existingClaim = existingClaims[0];
 
-      if (claimantNotificationError) {
-        console.error(
-          'Claim notification failed:',
-          claimantNotificationError
-        );
-      }
+        setClaimStatus(existingClaim.status);
 
-      const finderId = selectedMatch.found_item.user_id;
-
-      if (finderId && finderId !== user.id) {
-        const { error: finderNotificationError } =
-          await supabase
-            .from('notifications')
-            .insert([
-              {
-                user_id: finderId,
-                title: 'Claim Filed for Found Item',
-                message:
-                  `Another student has claimed ownership of the item "${selectedMatch.found_item.item_name}" you reported. Undergoing admin review.`
-              }
-            ]);
-
-        if (finderNotificationError) {
-          console.error(
-            'Finder notification failed:',
-            finderNotificationError
+        if (existingClaim.status === "pending") {
+          alert(
+            "You already have a claim pending for this match."
+          );
+        } else if (
+          existingClaim.status === "approved"
+        ) {
+          alert(
+            "Your claim has already been approved."
+          );
+        } else if (
+          existingClaim.status === "rejected"
+        ) {
+          alert(
+            "Your previous claim for this match was rejected."
           );
         }
+
+        return;
       }
 
-      const { error: matchUpdateError } = await supabase
-        .from('ai_matches')
-        .update({
-          status: 'claimed'
+      const {
+        data: newClaim,
+        error: claimError,
+      } = await supabase
+        .from("claims")
+        .insert({
+          lost_item_id: lostItemId,
+          found_item_id: foundItemId,
+          claimant_id: user.id,
+          status: "pending",
         })
-        .eq('id', selectedMatch.id);
+        .select("id, status")
+        .single();
 
-      if (matchUpdateError) {
-        console.error(
-          'Failed to update match status:',
-          matchUpdateError
-        );
+      if (claimError) {
+        throw claimError;
       }
+
+      setClaimStatus(newClaim.status);
 
       alert(
-        'Claim submitted successfully! The campus administrator will verify ownership details and notify you.'
+        "Claim request submitted. An administrator must approve it before contact details are revealed."
+      );
+    } catch (error) {
+      console.error(
+        "Error requesting claim:",
+        error
       );
 
-      setSelectedMatch(null);
-      await fetchMatches();
-    } catch (err) {
-      console.error('Failed to file claim:', err);
-
       alert(
-        'Failed to file claim: ' +
-        (err?.message || 'Unknown error')
+        error.message ||
+        "Unable to submit claim request."
       );
     } finally {
       setClaiming(false);
     }
+  };
 
+  const isLostOwner =
+    selectedMatch?.lost_item?.user_id === user?.id;
+
+  const isFoundOwner =
+    selectedMatch?.found_item?.user_id === user?.id;
+
+  const otherPersonLabel = isLostOwner
+    ? "Finder"
+    : "Item Owner";
+
+  const getClaimBadge = () => {
+    if (claimStatus === "pending") {
+      return (
+        <span className="badge bg-warning text-dark">
+          Claim Pending
+        </span>
+      );
+    }
+
+    if (claimStatus === "approved") {
+      return (
+        <span className="badge bg-success">
+          Claim Approved
+        </span>
+      );
+    }
+
+    if (claimStatus === "rejected") {
+      return (
+        <span className="badge bg-danger">
+          Claim Rejected
+        </span>
+      );
+    }
+
+    return (
+      <span className="badge bg-secondary">
+        No Claim Requested
+      </span>
+    );
   };
 
   if (loading) {
     return (
       <DashboardLayout>
-        <Loader message="Scanning your reports for matches..." />
+        <Loader />
       </DashboardLayout>
     );
   }
 
   if (selectedMatch) {
-    const isOwnerOfLost =
-      selectedMatch.lost_item?.user_id === user?.id;
+    const lostItem = selectedMatch.lost_item;
+    const foundItem = selectedMatch.found_item;
 
     return (
       <DashboardLayout>
-        <div className="mb-4 d-flex align-items-center justify-content-between">
-          <div>
-            <button
-              onClick={handleBackToList}
-              className="btn btn-outline-secondary btn-sm mb-2 rounded-3"
-            >
-              <i className="bi bi-arrow-left me-1"></i>
-              Back to Suggestions
-            </button>
-
-            <h2 className="fw-bold text-body-emphasis mb-0">
-              Manual Verification
-            </h2>
-          </div>
-
-          <span className="badge bg-primary px-3 py-2 fs-6 rounded-pill">
-            Match Score: {selectedMatch.match_score}%
-          </span>
-        </div>
-
-        <div className="card border-0 shadow-sm rounded-4 p-4 mb-4 bg-body-tertiary">
-          <div className="d-flex align-items-center gap-2 text-primary fw-bold mb-3">
-            <i className="bi bi-stars"></i>
-            <span>
-              AI MATCH INSIGHTS
-              {' '}
-              (Confidence: {selectedMatch.confidence})
-            </span>
-          </div>
-
-          <div className="row g-3 small text-secondary">
-            <div className="col-12 col-md-6">
-              <strong>Similarities:</strong>
-              <p className="mt-1">
-                {selectedMatch.similarities || 'No similarity details available.'}
-              </p>
-            </div>
-
-            <div className="col-12 col-md-6">
-              <strong>Differences:</strong>
-              <p className="mt-1">
-                {selectedMatch.differences || 'No difference details available.'}
-              </p>
-            </div>
-
-            <div className="col-12">
-              <strong>Recommendation:</strong>
-              <p className="mt-1 mb-0 text-dark fw-semibold">
-                {selectedMatch.recommendation || 'Review both reports manually.'}
-              </p>
-            </div>
-          </div>
-        </div>
-
-        <div className="row g-4 mb-4">
-
-          <div className="col-12 col-lg-6">
-            <div className="card border-0 shadow-sm rounded-4 overflow-hidden h-100 bg-body">
-
-              <div className="bg-warning bg-opacity-10 py-3 px-4 border-bottom d-flex justify-content-between align-items-center">
-                <h5 className="fw-bold text-warning-emphasis mb-0">
-                  <i className="bi bi-question-circle-fill me-2"></i>
-                  Lost Item Report
-                </h5>
-
-                {isOwnerOfLost && (
-                  <span className="badge bg-warning text-dark small">
-                    My Item
-                  </span>
-                )}
-              </div>
-
-              <div className="p-4 d-flex flex-column h-100">
-
-                <div
-                  className="bg-light rounded-4 overflow-hidden mb-3 d-flex align-items-center justify-content-center"
-                  style={{ height: '220px' }}
-                >
-                  {images.lost ? (
-                    <img
-                      src={images.lost}
-                      alt="Lost Preview"
-                      className="w-100 h-100"
-                      style={{ objectFit: 'cover' }}
-                    />
-                  ) : (
-                    <div className="text-muted text-center p-4">
-                      <i className="bi bi-image fs-1 d-block mb-1 text-secondary"></i>
-                      <p className="small mb-0">
-                        No image uploaded
-                      </p>
-                    </div>
-                  )}
-                </div>
-
-                <h4 className="fw-bold text-body-emphasis">
-                  {selectedMatch.lost_item?.item_name}
-                </h4>
-
-                <div className="row g-2 mb-3 mt-1 small">
-                  <div className="col-6">
-                    <strong>Category:</strong>{' '}
-                    <span className="text-capitalize">
-                      {selectedMatch.lost_item?.category}
-                    </span>
-                  </div>
-
-                  <div className="col-6">
-                    <strong>Brand:</strong>{' '}
-                    {selectedMatch.lost_item?.brand || 'N/A'}
-                  </div>
-
-                  <div className="col-6">
-                    <strong>Color:</strong>{' '}
-                    {selectedMatch.lost_item?.color || 'N/A'}
-                  </div>
-
-                  <div className="col-6">
-                    <strong>Date Lost:</strong>{' '}
-                    {selectedMatch.lost_item?.date_lost || 'N/A'}
-                  </div>
-
-                  <div className="col-12">
-                    <strong>Location:</strong>{' '}
-                    {selectedMatch.lost_item?.location || 'N/A'}
-                  </div>
-                </div>
-
-                <hr className="mt-auto opacity-10" />
-
-                <h6 className="fw-bold text-secondary">
-                  Item Description:
-                </h6>
-
-                <p className="small text-secondary mb-0 leading-relaxed">
-                  {selectedMatch.lost_item?.description || 'No description available.'}
-                </p>
-              </div>
-            </div>
-          </div>
-
-          <div className="col-12 col-lg-6">
-            <div className="card border-0 shadow-sm rounded-4 overflow-hidden h-100 bg-body">
-
-              <div className="bg-success bg-opacity-10 py-3 px-4 border-bottom d-flex justify-content-between align-items-center">
-                <h5 className="fw-bold text-success-emphasis mb-0">
-                  <i className="bi bi-search me-2"></i>
-                  Found Item Report
-                </h5>
-
-                {!isOwnerOfLost && (
-                  <span className="badge bg-success small">
-                    My Item
-                  </span>
-                )}
-              </div>
-
-              <div className="p-4 d-flex flex-column h-100">
-
-                <div
-                  className="bg-light rounded-4 overflow-hidden mb-3 d-flex align-items-center justify-content-center"
-                  style={{ height: '220px' }}
-                >
-                  {images.found ? (
-                    <img
-                      src={images.found}
-                      alt="Found Preview"
-                      className="w-100 h-100"
-                      style={{ objectFit: 'cover' }}
-                    />
-                  ) : (
-                    <div className="text-muted text-center p-4">
-                      <i className="bi bi-image fs-1 d-block mb-1 text-secondary"></i>
-                      <p className="small mb-0">
-                        No image uploaded
-                      </p>
-                    </div>
-                  )}
-                </div>
-
-                <h4 className="fw-bold text-body-emphasis">
-                  {selectedMatch.found_item?.item_name}
-                </h4>
-
-                <div className="row g-2 mb-3 mt-1 small">
-                  <div className="col-6">
-                    <strong>Category:</strong>{' '}
-                    <span className="text-capitalize">
-                      {selectedMatch.found_item?.category}
-                    </span>
-                  </div>
-
-                  <div className="col-6">
-                    <strong>Brand:</strong>{' '}
-                    {selectedMatch.found_item?.brand || 'N/A'}
-                  </div>
-
-                  <div className="col-6">
-                    <strong>Color:</strong>{' '}
-                    {selectedMatch.found_item?.color || 'N/A'}
-                  </div>
-
-                  <div className="col-6">
-                    <strong>Date Found:</strong>{' '}
-                    {selectedMatch.found_item?.date_found || 'N/A'}
-                  </div>
-
-                  <div className="col-12">
-                    <strong>Location:</strong>{' '}
-                    {selectedMatch.found_item?.location || 'N/A'}
-                  </div>
-                </div>
-
-                <hr className="mt-auto opacity-10" />
-
-                <h6 className="fw-bold text-secondary">
-                  Item Description:
-                </h6>
-
-                <p className="small text-secondary mb-0 leading-relaxed">
-                  {selectedMatch.found_item?.description || 'No description available.'}
-                </p>
-              </div>
-            </div>
-          </div>
-
-        </div>
-
-        <div className="card border-0 shadow-sm rounded-4 p-3 bg-body d-flex flex-row justify-content-end gap-3">
+        <div className="container py-4">
 
           <button
-            onClick={() =>
-              handleDismissMatch(selectedMatch.id)
-            }
-            className="btn btn-outline-danger px-4 rounded-3 fw-bold"
-            disabled={claiming}
+            className="btn btn-outline-secondary mb-4"
+            onClick={() => setSelectedMatch(null)}
           >
-            <i className="bi bi-trash me-1"></i>
-            Dismiss Suggestion
+            <i className="bi bi-arrow-left me-2"></i>
+            Back to Suggested Matches
           </button>
 
-          {isOwnerOfLost && (
-            <button
-              onClick={handleInitiateClaim}
-              className="btn btn-primary px-5 rounded-3 fw-bold"
-              disabled={claiming}
-            >
-              {claiming ? (
-                <>
-                  <span
-                    className="spinner-border spinner-border-sm me-2"
-                    role="status"
-                  ></span>
-                  Filing Claim...
-                </>
-              ) : (
-                <>
-                  <i className="bi bi-check2-circle me-1"></i>
-                  Request Claim
-                </>
-              )}
-            </button>
-          )}
+          <div className="card shadow-sm border-0 mb-4">
+            <div className="card-body">
 
-          {!isOwnerOfLost && (
-            <div className="alert alert-secondary mb-0 py-2 small d-flex align-items-center">
-              <i className="bi bi-info-circle-fill me-2 fs-5"></i>
-              Wait for the owner of the lost report to initiate the claim,
-              or suggest they review this.
+              <div className="d-flex justify-content-between align-items-start flex-wrap gap-3">
+
+                <div>
+                  <h3 className="mb-1">
+                    Suggested Match
+                  </h3>
+
+                  <p className="text-muted mb-0">
+                    AI-assisted comparison between a
+                    lost and found report.
+                  </p>
+                </div>
+
+                <div className="text-end">
+
+                  <div className="display-6 fw-bold text-primary">
+                    {selectedMatch.match_score}%
+                  </div>
+
+                  <small className="text-muted">
+                    Confidence:{" "}
+                    {selectedMatch.confidence}
+                  </small>
+
+                </div>
+
+              </div>
+
+            </div>
+          </div>
+
+          <div className="row g-4">
+
+            <div className="col-md-6">
+              <div className="card h-100 shadow-sm">
+
+                {images.lost && (
+                  <img
+                    src={images.lost}
+                    className="card-img-top"
+                    alt={
+                      lostItem?.item_name ||
+                      "Lost item"
+                    }
+                    style={{
+                      maxHeight: "280px",
+                      objectFit: "cover",
+                    }}
+                  />
+                )}
+
+                <div className="card-body">
+
+                  <h5>
+                    <i className="bi bi-search me-2"></i>
+                    Lost Item
+                  </h5>
+
+                  <h4>
+                    {lostItem?.item_name ||
+                      "Unknown item"}
+                  </h4>
+
+                  {lostItem?.category && (
+                    <p className="mb-1">
+                      <strong>Category:</strong>{" "}
+                      {lostItem.category}
+                    </p>
+                  )}
+
+                  {lostItem?.brand && (
+                    <p className="mb-1">
+                      <strong>Brand:</strong>{" "}
+                      {lostItem.brand}
+                    </p>
+                  )}
+
+                  {lostItem?.color && (
+                    <p className="mb-1">
+                      <strong>Color:</strong>{" "}
+                      {lostItem.color}
+                    </p>
+                  )}
+
+                  {lostItem?.description && (
+                    <p className="mt-3 mb-0">
+                      <strong>Description:</strong>{" "}
+                      {lostItem.description}
+                    </p>
+                  )}
+
+                  {lostItem?.location && (
+                    <p className="mt-2 mb-0">
+                      <strong>Location:</strong>{" "}
+                      {lostItem.location}
+                    </p>
+                  )}
+
+                </div>
+              </div>
+            </div>
+
+            <div className="col-md-6">
+              <div className="card h-100 shadow-sm">
+
+                {images.found && (
+                  <img
+                    src={images.found}
+                    className="card-img-top"
+                    alt={
+                      foundItem?.item_name ||
+                      "Found item"
+                    }
+                    style={{
+                      maxHeight: "280px",
+                      objectFit: "cover",
+                    }}
+                  />
+                )}
+
+                <div className="card-body">
+
+                  <h5>
+                    <i className="bi bi-box-seam me-2"></i>
+                    Found Item
+                  </h5>
+
+                  <h4>
+                    {foundItem?.item_name ||
+                      "Unknown item"}
+                  </h4>
+
+                  {foundItem?.category && (
+                    <p className="mb-1">
+                      <strong>Category:</strong>{" "}
+                      {foundItem.category}
+                    </p>
+                  )}
+
+                  {foundItem?.brand && (
+                    <p className="mb-1">
+                      <strong>Brand:</strong>{" "}
+                      {foundItem.brand}
+                    </p>
+                  )}
+
+                  {foundItem?.color && (
+                    <p className="mb-1">
+                      <strong>Color:</strong>{" "}
+                      {foundItem.color}
+                    </p>
+                  )}
+
+                  {foundItem?.description && (
+                    <p className="mt-3 mb-0">
+                      <strong>Description:</strong>{" "}
+                      {foundItem.description}
+                    </p>
+                  )}
+
+                  {foundItem?.location && (
+                    <p className="mt-2 mb-0">
+                      <strong>Location:</strong>{" "}
+                      {foundItem.location}
+                    </p>
+                  )}
+
+                </div>
+              </div>
+            </div>
+
+          </div>
+
+          <div className="card shadow-sm border-0 mt-4">
+            <div className="card-body">
+
+              <h5 className="mb-3">
+                <i className="bi bi-stars me-2"></i>
+                AI Match Analysis
+              </h5>
+
+              <div className="row g-3">
+
+                <div className="col-md-6">
+                  <div className="p-3 bg-light rounded">
+
+                    <strong>Similarities</strong>
+
+                    <p className="mb-0 mt-2">
+                      {selectedMatch.similarities ||
+                        "No similarity details available."}
+                    </p>
+
+                  </div>
+                </div>
+
+                <div className="col-md-6">
+                  <div className="p-3 bg-light rounded">
+
+                    <strong>Differences</strong>
+
+                    <p className="mb-0 mt-2">
+                      {selectedMatch.differences ||
+                        "No difference details available."}
+                    </p>
+
+                  </div>
+                </div>
+
+              </div>
+
+              <div className="alert alert-info mt-3 mb-0">
+                <strong>
+                  AI Recommendation:
+                </strong>{" "}
+                {selectedMatch.recommendation ||
+                  "Review the item details carefully before requesting a claim."}
+              </div>
+
+            </div>
+          </div>
+
+          <div className="card shadow-sm border-0 mt-4">
+            <div className="card-body">
+
+              <div className="d-flex justify-content-between align-items-center flex-wrap gap-2">
+
+                <h5 className="mb-0">
+                  <i className="bi bi-shield-check me-2"></i>
+                  Claim Status
+                </h5>
+
+                {getClaimBadge()}
+
+              </div>
+
+              {loadingClaim && (
+                <div className="mt-3 text-muted">
+                  Checking claim status...
+                </div>
+              )}
+
+              {!loadingClaim &&
+                claimStatus === "pending" && (
+                  <div className="alert alert-warning mt-3 mb-0">
+                    <strong>
+                      Claim submitted.
+                    </strong>
+
+                    <br />
+
+                    An administrator must verify your
+                    claim before contact details are
+                    revealed.
+                  </div>
+                )}
+
+              {!loadingClaim &&
+                claimStatus === "rejected" && (
+                  <div className="alert alert-danger mt-3 mb-0">
+                    Your claim was rejected by an
+                    administrator. Contact information
+                    remains hidden.
+                  </div>
+                )}
+
+              {!loadingClaim &&
+                claimStatus === "approved" && (
+                  <div className="alert alert-success mt-3 mb-0">
+                    <strong>
+                      Your claim has been approved.
+                    </strong>
+
+                    <br />
+
+                    Contact information is now available
+                    for arranging a safe handover.
+                  </div>
+                )}
+
+              {!loadingClaim &&
+                !claimStatus &&
+                isLostOwner && (
+                  <div className="mt-3">
+
+                    <p className="text-muted">
+                      If you believe this is your lost
+                      item, submit a claim request. An
+                      administrator will verify it.
+                    </p>
+
+                    <button
+                      className="btn btn-primary"
+                      onClick={handleInitiateClaim}
+                      disabled={claiming}
+                    >
+                      {claiming ? (
+                        <>
+                          <span
+                            className="spinner-border spinner-border-sm me-2"
+                            role="status"
+                            aria-hidden="true"
+                          ></span>
+                          Submitting...
+                        </>
+                      ) : (
+                        <>
+                          <i className="bi bi-send me-2"></i>
+                          Request Claim
+                        </>
+                      )}
+                    </button>
+
+                  </div>
+                )}
+
+              {!loadingClaim &&
+                !claimStatus &&
+                !isLostOwner &&
+                isFoundOwner && (
+                  <div className="alert alert-info mt-3 mb-0">
+                    The lost-item owner must request
+                    the claim. You will be able to
+                    coordinate the handover after the
+                    claim is approved.
+                  </div>
+                )}
+
+            </div>
+          </div>
+
+          {claimStatus === "approved" && (
+            <div className="card shadow-sm border-0 mt-4">
+              <div className="card-body">
+
+                <h5 className="mb-3">
+                  <i className="bi bi-person-lines-fill me-2"></i>
+                  Contact & Safe Handover
+                </h5>
+
+                {contactInfo ? (
+                  <>
+                    <div className="alert alert-success">
+
+                      <strong>
+                        Approved contact:
+                      </strong>{" "}
+                      {contactInfo.full_name ||
+                        otherPersonLabel}
+
+                      <br />
+
+                      {contactInfo.phone ? (
+                        <span>
+                          Phone:{" "}
+                          <strong>
+                            {contactInfo.phone}
+                          </strong>
+                        </span>
+                      ) : (
+                        <span>
+                          No phone number is available.
+                        </span>
+                      )}
+
+                    </div>
+
+                    {contactInfo.phone && (
+                      <div className="d-flex flex-wrap gap-2 mb-4">
+
+                        <a
+                          href={`tel:${contactInfo.phone}`}
+                          className="btn btn-success"
+                        >
+                          <i className="bi bi-telephone-fill me-2"></i>
+                          Call {otherPersonLabel}
+                        </a>
+
+                        <a
+                          href={`https://wa.me/${String(
+                            contactInfo.phone
+                          ).replace(/\D/g, "")}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="btn btn-outline-success"
+                        >
+                          <i className="bi bi-whatsapp me-2"></i>
+                          WhatsApp Message
+                        </a>
+
+                      </div>
+                    )}
+
+                    <div className="border rounded p-3">
+
+                      <h6>
+                        <i className="bi bi-geo-alt-fill me-2"></i>
+                        Recommended Safe Handover Locations
+                      </h6>
+
+                      <p className="text-muted small">
+                        For everyone's safety, arrange the
+                        exchange at an official campus
+                        location rather than a private or
+                        isolated location.
+                      </p>
+
+                      <ul className="mb-0">
+                        {HANDOVER_LOCATIONS.map(
+                          (location) => (
+                            <li key={location}>
+                              {location}
+                            </li>
+                          )
+                        )}
+                      </ul>
+
+                    </div>
+                  </>
+                ) : (
+                  <div className="alert alert-warning mb-0">
+                    Your claim is approved, but contact
+                    information could not be retrieved.
+                    Please contact campus administration
+                    for assistance.
+                  </div>
+                )}
+
+              </div>
             </div>
           )}
+
+          <div className="d-flex flex-wrap gap-2 mt-4">
+
+            <button
+              className="btn btn-outline-danger"
+              onClick={() =>
+                handleDismissMatch(
+                  selectedMatch.id
+                )
+              }
+            >
+              <i className="bi bi-x-circle me-2"></i>
+              Dismiss Suggestion
+            </button>
+
+            <button
+              className="btn btn-outline-secondary"
+              onClick={() =>
+                setSelectedMatch(null)
+              }
+            >
+              Back to Matches
+            </button>
+
+          </div>
 
         </div>
       </DashboardLayout>
     );
-
   }
 
   return (
     <DashboardLayout>
-      <div className="mb-4">
-        <h2 className="fw-bold text-body-emphasis">
-          Suggested Matches
-        </h2>
+      <div className="container py-4">
 
-        <p className="text-secondary">
-          AI recommendations linking your reported items with active listings.
-        </p>
-      </div>
+        <div className="mb-4">
+          <h2>
+            <i className="bi bi-stars me-2"></i>
+            Suggested Matches
+          </h2>
 
-      {matches.length > 0 ? (
-        <div className="row g-4">
+          <p className="text-muted">
+            AI-generated matches between your
+            lost/found reports and relevant campus
+            reports.
+          </p>
+        </div>
 
-          {matches.map((match) => {
-            const isOwnerOfLost =
-              match.lost_item?.user_id === user?.id;
+        {matches.length === 0 ? (
+          <div className="card shadow-sm border-0">
+            <div className="card-body text-center py-5">
 
-            return (
+              <i className="bi bi-search display-4 text-muted"></i>
+
+              <h4 className="mt-3">
+                No suggested matches
+              </h4>
+
+              <p className="text-muted mb-0">
+                We will show potential matches here
+                when the AI matching system finds
+                relevant reports.
+              </p>
+
+            </div>
+          </div>
+        ) : (
+          <div className="row g-4">
+
+            {matches.map((match) => (
               <div
+                className="col-md-6 col-lg-4"
                 key={match.id}
-                className="col-12 col-md-6 col-lg-4"
               >
-                <div className="card border-0 shadow-sm rounded-4 p-4 bg-body hover-shadow transition-all d-flex flex-column justify-content-between h-100">
+                <div className="card h-100 shadow-sm border-0">
 
-                  <div>
+                  <div className="card-body">
 
-                    <div className="d-flex align-items-center justify-content-between mb-3">
+                    <div className="d-flex justify-content-between align-items-start mb-3">
 
-                      <span className="badge bg-primary-subtle text-primary px-3 py-1 rounded-pill fw-bold small">
-                        {match.match_score}% Score
+                      <span className="badge bg-primary">
+                        {match.match_score}% Match
                       </span>
 
-                      <span className="small text-muted">
-                        {match.created_at
-                          ? new Date(
-                            match.created_at
-                          ).toLocaleDateString()
-                          : 'Recently'}
+                      <span className="badge bg-light text-dark">
+                        {match.confidence}
                       </span>
 
                     </div>
 
-                    <div className="mb-3">
-                      <h6 className="text-uppercase small fw-bold text-secondary mb-1">
-                        Lost Item:
-                      </h6>
+                    <h5 className="card-title">
 
-                      <span className="fw-bold text-body-emphasis">
-                        {match.lost_item?.item_name || 'Unknown'}
-                      </span>
+                      {match.lost_item?.item_name ||
+                        "Lost item"}
 
-                      {isOwnerOfLost && (
-                        <span className="badge bg-warning text-dark ms-2 small">
-                          Mine
-                        </span>
-                      )}
-                    </div>
+                      <i className="bi bi-arrow-left-right mx-1"></i>
 
-                    <div className="mb-3">
-                      <h6 className="text-uppercase small fw-bold text-secondary mb-1">
-                        Found Item:
-                      </h6>
+                      {match.found_item?.item_name ||
+                        "Found item"}
 
-                      <span className="fw-bold text-body-emphasis">
-                        {match.found_item?.item_name || 'Unknown'}
-                      </span>
+                    </h5>
 
-                      {!isOwnerOfLost && (
-                        <span className="badge bg-success ms-2 small">
-                          Mine
-                        </span>
-                      )}
-                    </div>
-
-                    <hr className="opacity-10 my-3" />
-
-                    <p className="small text-secondary mb-0 text-truncate-3">
-                      <strong>AI Suggestion:</strong>{' '}
+                    <p className="text-muted small">
                       {match.recommendation ||
-                        'Review this potential match.'}
+                        "Potential match identified by AI."}
                     </p>
 
+                    <div className="small text-muted mb-3">
+                      <strong>
+                        Similarities:
+                      </strong>{" "}
+                      {match.similarities ||
+                        "Not available"}
+                    </div>
+
+                    <button
+                      className="btn btn-primary w-100"
+                      onClick={() =>
+                        openMatch(match)
+                      }
+                    >
+                      <i className="bi bi-eye me-2"></i>
+                      Inspect Match Details
+                    </button>
+
                   </div>
-
-                  <button
-                    onClick={() => handleSelectMatch(match)}
-                    className="btn btn-primary w-100 mt-4 py-2 rounded-3 fw-bold"
-                  >
-                    Verify Match Details
-                  </button>
-
                 </div>
               </div>
-            );
-          })}
+            ))}
 
-        </div>
-      ) : (
-        <div className="card text-center border-0 shadow-sm p-5 bg-body rounded-4">
+          </div>
+        )}
 
-          <i className="bi bi-stars display-1 text-info mb-3"></i>
-
-          <h4 className="fw-bold text-body-emphasis">
-            No AI Matches Found
-          </h4>
-
-          <p className="text-muted small mb-0">
-            Gemini will auto-suggest matches once new items are
-            cataloged in the system.
-          </p>
-
-        </div>
-      )}
-
+      </div>
     </DashboardLayout>
-
   );
-};
+}
 
-export default SuggestedMatches;
